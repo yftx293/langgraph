@@ -56,14 +56,6 @@ def store(request) -> PostgresStore:
         conn.execute(f"CREATE DATABASE {database}")
     try:
         with PostgresStore.from_conn_string(conn_string, ttl=ttl_config) as store:
-            store.MIGRATIONS = [
-                (
-                    mig.replace("ttl_minutes INT;", "ttl_minutes FLOAT;")
-                    if isinstance(mig, str)
-                    else mig
-                )
-                for mig in store.MIGRATIONS
-            ]
             store.setup()
 
         if request.param == "pipe":
@@ -963,6 +955,55 @@ def test_nonnull_migrations() -> None:
     for migration in PostgresStore.MIGRATIONS:
         statement = _leading_comment_remover.sub("", migration).split()[0]
         assert statement.strip()
+
+
+def test_ttl_migration_upgrades_existing_integer_column(store: PostgresStore) -> None:
+    store.stop_ttl_sweeper()
+    ns = ("migration",)
+    store.put(ns, "item", {"value": "preserved"}, ttl=1.0)
+    with store._cursor() as cur:
+        cur.execute(
+            "ALTER TABLE store ALTER COLUMN ttl_minutes TYPE INTEGER "
+            "USING ttl_minutes::INTEGER"
+        )
+        cur.execute(
+            "DELETE FROM store_migrations WHERE v = %s",
+            (len(store.MIGRATIONS) - 1,),
+        )
+
+    store.setup()
+    with store._cursor() as cur:
+        cur.execute(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_schema = current_schema() "
+            "AND table_name = 'store' AND column_name = 'ttl_minutes'"
+        )
+        assert cur.fetchone()["data_type"] == "double precision"
+    item = store.get(ns, "item", refresh_ttl=False)
+    assert item is not None
+    assert item.value == {"value": "preserved"}
+
+
+@pytest.mark.parametrize("ttl_minutes", [0.25, 1.4])
+def test_fractional_ttl_refresh(store: PostgresStore, ttl_minutes: float) -> None:
+    store.stop_ttl_sweeper()
+    ns = ("fractional_ttl",)
+    store.put(ns, "item", {"value": 1}, ttl=ttl_minutes)
+
+    for read_path in ("get", "search"):
+        if read_path == "get":
+            assert store.get(ns, "item", refresh_ttl=True) is not None
+        else:
+            assert [item.key for item in store.search(ns, refresh_ttl=True)] == ["item"]
+        with store._cursor() as cur:
+            cur.execute(
+                "SELECT ttl_minutes, expires_at > NOW() AS still_live "
+                "FROM store WHERE prefix = %s AND key = %s",
+                (".".join(ns), "item"),
+            )
+            row = cur.fetchone()
+        assert row["ttl_minutes"] == pytest.approx(ttl_minutes)
+        assert row["still_live"] is True
 
 
 def test_store_ttl(store):

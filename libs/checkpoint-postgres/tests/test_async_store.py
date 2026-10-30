@@ -59,14 +59,6 @@ async def store(request) -> AsyncIterator[AsyncPostgresStore]:
         async with AsyncPostgresStore.from_conn_string(
             conn_string, ttl=ttl_config
         ) as store:
-            store.MIGRATIONS = [
-                (
-                    mig.replace("ttl_minutes INT;", "ttl_minutes FLOAT;")
-                    if isinstance(mig, str)
-                    else mig
-                )
-                for mig in store.MIGRATIONS
-            ]
             await store.setup()
             async with store._cursor() as cur:
                 # drop the migration index
@@ -716,6 +708,32 @@ async def test_search_sorting(
         assert len(set(r.key for r in results)) == 10
         assert results[0].key == "M"
         assert results[0].score > results[1].score
+
+
+@pytest.mark.parametrize("ttl_minutes", [0.25, 1.4])
+async def test_fractional_ttl_refresh(
+    store: AsyncPostgresStore, ttl_minutes: float
+) -> None:
+    await store.stop_ttl_sweeper()
+    ns = ("fractional_ttl",)
+    await store.aput(ns, "item", {"value": 1}, ttl=ttl_minutes)
+
+    for read_path in ("get", "search"):
+        if read_path == "get":
+            assert await store.aget(ns, "item", refresh_ttl=True) is not None
+        else:
+            assert [
+                item.key for item in await store.asearch(ns, refresh_ttl=True)
+            ] == ["item"]
+        async with store._cursor() as cur:
+            await cur.execute(
+                "SELECT ttl_minutes, expires_at > NOW() AS still_live "
+                "FROM store WHERE prefix = %s AND key = %s",
+                (".".join(ns), "item"),
+            )
+            row = await cur.fetchone()
+        assert row["ttl_minutes"] == pytest.approx(ttl_minutes)
+        assert row["still_live"] is True
 
 
 async def test_store_ttl(store):

@@ -88,6 +88,10 @@ ADD COLUMN IF NOT EXISTS ttl_minutes INT;
 CREATE INDEX IF NOT EXISTS idx_store_expires_at ON store (expires_at)
 WHERE expires_at IS NOT NULL;
 """,
+    """
+-- Preserve fractional TTL values when upgrading existing stores.
+ALTER TABLE store ALTER COLUMN ttl_minutes TYPE DOUBLE PRECISION;
+""",
 ]
 
 VECTOR_MIGRATIONS: Sequence[Migration] = [
